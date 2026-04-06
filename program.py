@@ -238,6 +238,15 @@ def _attn_fwd(
             SEQ_LEN,
         )
 
+    m_i += tl.math.log(l_i)  # Needed to compute the logsumexp for the backward pass
+
+    O_block = O_block / l_i[:, None]
+
+    m_ptr = M + index_batch_head * SEQ_LEN + offs_q
+
+    tl.store(m_ptr, m_i)
+    tl.store(O_block_ptr, O_block.to(O.type.element_ty))
+
 
 class TritonAttention(torch.autograd.Function):
 
