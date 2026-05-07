@@ -248,6 +248,25 @@ def _attn_fwd(
     tl.store(O_block_ptr, O_block.to(O.type.element_ty))
 
 
+@triton.jit
+def _attn_bwd_preprocess(
+    O, dO, D, SEQ_LEN, BLOCK_SIZE_Q: tl.constexpr, HEAD_DIM: tl.constexpr  # 4
+):
+    block_index_q = tl.program_id(0)
+
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arrange(0, BLOCK_SIZE_Q)
+    index_batch_head = tl.program_id(1)
+    offs_dim = tl.arrange(0, HEAD_DIM)
+
+    # Load a single block of BLOCK_SIZE_Q rows of O
+    O_block = tl.load(  # O [BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM]
+        O
+        + index_batch_head * HEAD_DIM * SEQ_LEN  # skip all the other batches and heads
+        + offs_q[:, None] * HEAD_DIM
+        + offs_dim[None, :]
+    )  # Shape: (BLOCK_SIZE_Q, HEAD_DIM)
+
+
 class TritonAttention(torch.autograd.Function):
 
     @staticmethod
@@ -318,6 +337,34 @@ class TritonAttention(torch.autograd.Function):
         ctx.causal = causal
 
         return O
+
+    @staticmethod
+    def backward(ctx, dO):
+        Q, K, V, O, M = ctx.saved_tensors
+
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
+        NUM_WARPS, NUM_STAGES = 4, 3
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
+        D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
+
+        # Compute all the elements Di
+        _attn_bwd_preprocess[preprocess_grid](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
+            HEAD_DIM=ctx.HEAD_DIM,
+        )
 
 
 def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):  # $
